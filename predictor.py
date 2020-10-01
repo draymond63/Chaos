@@ -4,7 +4,7 @@ from tqdm import tqdm
 
 def float_range(start, stop, step):
   while start < stop:
-    yield float(start)
+    yield round(float(start), 5)
     start += step
 
 class Predictor():
@@ -48,58 +48,55 @@ class Predictor():
             predictions.append(x)
         # Find the average result and return it
         avg_pred = sum(predictions)/len(predictions)
-        return 1 if avg_pred > self.threshold else 0
+        return round(avg_pred)
 
-
-    def train(self, r: iter, data: list, window=None, r_step=1e-4, x_step=.01, threshold='data'):
+    # * Callable train function that chooses window if requested
+    def train(self, r: iter, data: list, window=None, r_step=1e-4, x_step=.01, recursion=0):
         assert len(r) == 2, f"'r' range requires a beginning and end (length 2), not {r}"
-        self.r_step = r_step
-        self.x_step = x_step
-        # Set the threshold
-        if threshold == 'data':
-            assert 1 in data and 0 in data, "To use data for threshold, it must be comprised of 1s and 0s"
-            self.threshold = 1 - sum(data) / len(data) # ! Get percentage of 1s in data
-            print(self.threshold)
-        else:
-            assert isinstance(threshold, float), f"Threshold must be 'data' or a float, not {threshold}"
-            self.threshold = threshold
+        self.problems = []
+        if window:  return self.rolling_train(r, data, window, r_step, x_step, recursion)
+        else:       return self.absolute_train(r, data, r_step, x_step, True, False, recursion, True)
 
-        if window:  return self.rolling_train(r, data, window, r_step, x_step, threshold)
-        else:       return self.absolute_train(r, data, r_step, x_step, threshold)
-
-    # Train an r range for each window and test it's prediction ability for the next data point    
-    def rolling_train(self, r: iter, data: list, window=10, r_step=1e-4, x_step=.05, threshold=0.5):
+    # * Train an r range for each window and test it's prediction ability for the next data point    
+    def rolling_train(self, r: iter, data: list, window=10, r_step=1e-4, x_step=.05, recursion=0):
         R_groups = []
         success = 0
+        total = 0
 
         for i in tqdm([*range(len(data) - window - 1)]):
             # Get the data we need to train on
             w_end = i + window
             w_data = data[i:w_end]
             # Train R values and store it
-            Rs = self.absolute_train(r, w_data, r_step, x_step, threshold, ret=True, perfection=False)
-            R_groups.append(Rs)
-            # Predict the next piece of data
-            guess = self.predict(Rs=Rs)
-            if guess == data[w_end + 1]:
-                success += 1
-            # Write the current success rate
-            # tqdm.write(f'{success / (i + 1) * 100}') 
+            Rs = self.absolute_train(r, w_data, r_step, x_step, ret=True, perfection=False, recursion=recursion)
+            if len(Rs) != 1:
+                R_groups.append(Rs)
+                # Predict the next piece of data
+                guess = self.predict(Rs=Rs)
+                if guess == data[w_end + 1]:
+                    success += 1
+                else:
+                    self.problems.append(w_data)
+
+                # Write the current success rate
+                total += 1
+                tqdm.write(f'{success / total * 100}') 
         
         self.Rs = R_groups
         print('Prediction Rate:', success / len(data) * 100)
         return success / len(data) * 100
 
-
-
-    def absolute_train(self, r: iter, data: list, r_step=1e-7, x_step=.01, threshold=0.5, ret=False, perfection=True):
-        Rs = {}
+    # * Train an r range using all the data given
+    def absolute_train(self, r: iter, data: list, r_step=1e-7, x_step=.01, ret=False, perfection=True, recursion=0, use_tqdm=False):
+        # Optionally have the tqdm bar
+        iteration = tqdm([*float_range(*r, r_step)]) if use_tqdm else float_range(*r, r_step)
         # Iterate through possible r-values
+        Rs = {}
         best = None
         best_r_val = 0
-        for current_r in float_range(*r, r_step):
+        for current_r in iteration:
             # Try different inital x values
-            for init_x in float_range(0, 1, x_step):
+            for init_x in float_range(0 + x_step, 1 - x_step, x_step):
                 r_is_good, fin_x = self.test_r_value(current_r, data, init_x, ret_x=True)
                 # If there is a switch in the range
                 if r_is_good == 1:
@@ -109,6 +106,9 @@ class Predictor():
                     best_r_val = r_is_good
                     best = {current_r: init_x}
 
+        # Try a finer gradient for r if requested
+        if recursion and len(Rs) == 0:
+            Rs = self.absolute_train(r, data, r_step/10, x_step, True, perfection, recursion - 1, use_tqdm)
         if perfection:
             assert len(Rs), "No r-values found"
         if len(Rs):
@@ -118,16 +118,19 @@ class Predictor():
             return best
 
 
-    def test_r_value(self, r: float, data: list, x=0.5, ret_x=False) -> float:
+    def test_r_value(self, r: float, data: list, x_0=0.5, ret_x=False) -> float:
         assert isinstance(data[0], (bool, int)), f"Data given must be a list of 1/0s or True/Falses, not {type(data[0])}"
         # Iterate through the logistic map, comparing it to the data
         for index, answer in enumerate(data):
-            x = self.logistic_map(r, x)
-            # Is below threshold and answer = 1 or above and answer = 0, it's wrong
-            if (x > self.threshold) ^ answer:
+            x_1 = self.logistic_map(r, x_0)
+            # R == 0, L == 0
+            moved_right = x_0 < x_1
+            if moved_right ^ answer:
                 progress = index/len(data) # Return how far it got (as a decimal)
-                return (progress, x) if ret_x else progress
-        return (1, x) if ret_x else 1
+                return (progress, x_1) if ret_x else progress
+            # Move a step in the iteration
+            x_0 = x_1
+        return (1, x_1) if ret_x else 1
 
     def _parabolic_map(self, r: float, x: float) -> float:
         return r * x * (1 - x)
@@ -147,52 +150,24 @@ def get_weather_AUS(location = 'Albury'):
     return list(data)
 
 
-### Threshold: Data
-# WINDOW: 5       6
-#-------------------------------------
-# 1:    81.0    __._
-# 7:    59.8    __._
-# 14:   57.8    __._
-
-### Threshold: 0.5
-# WINDOW: 5       6
-#-------------------------------------
-# 1:    __._    __._
-# 7:    __._    __._
-# 14:   __._    __._
+### Threshold = data, window = 5, days-ahead = 1: acurracy of 81 %
 
 
 if __name__ == "__main__":
     data = get_weather_AUS()
+    test = data[::7]
     p = Predictor()
+    r = p.train([0, 4], test, window=6, r_step=1e-2, x_step=1e-4)
+    p.save('model.json')
+    print(r)
 
-    days_ahead = (1, 7, 14)
-    windows = (6, 8, 10)
-    thresholds = ('data', 0.5) # ! SEE WHETHER IT WENT LEFT OR RIGHT, NOT ABOVE OR BELOW THRESHOLD
+    # with open('problems.json', 'w') as f:
+    #     json.dump(p.problems, f)
 
-    results = []
-
-    for t in thresholds:
-        if t == 0.5:
-            window = (5, *windows)
-        for s in days_ahead:
-            for w in windows:
-                test = data[::s]
-                # Shave off the later ones
-                if s == 1:
-                    test = test[:300]
-                print('STARTING (t, s, w, l):', t, s, w, len(test))
-                r = p.train([3, 4], test, window=w, threshold=t)
-
-                results.append({
-                    'threshold': t,
-                    'days-ahead': s,
-                    'window': w,
-                    'length': len(test),
-                    'success': r,
-                })
-
-    with open('results.json', 'r') as f:
-        json.dump(results, f)
+    # data = [0, 1, 1, 1, 0, 1, 0, 0] # 0
+    # p = Predictor()
+    # r = p.absolute_train([3.3, 4], data, 1e-3, 1e-4, perfection=False, ret=True, use_tqdm=True) 
+    # print(r)
+    # print(p.predict())
 
 
