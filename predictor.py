@@ -8,8 +8,10 @@ def float_range(start, stop, step):
     start += step
 
 class Predictor():
-    def __init__(self, Map='parabolic', Rs_file=None):
+    def __init__(self, Map='parabolic', Rs_file=None, threshold=0.5):
+        self.threshold = threshold
         self.Rs = {}
+        self.problems = []
         # Choosing the logistic map
         if Map == 'parabolic':
             self.logistic_map = self._parabolic_map
@@ -21,7 +23,6 @@ class Predictor():
                 self.Rs = json.load(f)
 
     def save(self, Rs_file):
-        assert hasattr(self, 'Rs'), "Model must be trained or loaded before saving"
         with open(Rs_file, 'w') as f:
                 json.dump(self.Rs, f)
 
@@ -34,7 +35,6 @@ class Predictor():
         return correct / len(data)
 
     def predict(self, time_steps=1, Rs=None) -> float:
-        assert hasattr(self, 'Rs'), "Model must be trained or loaded before predicting"
         # Give the option to provide a dictionary
         if not Rs:
             Rs = self.Rs
@@ -45,20 +45,19 @@ class Predictor():
             for _ in range(time_steps):
                 x = self.logistic_map(r, x)
             # Grab the final prediction for that branch
-            predictions.append(x)
+            predictions.append(1 if x > self.threshold else 0)
         # Find the average result and return it
         avg_pred = sum(predictions)/len(predictions)
-        return round(avg_pred)
+        return avg_pred # ! ROUND THIS
 
     # * Callable train function that chooses window if requested
     def train(self, r: iter, data: list, window=None, r_step=1e-4, x_step=.01, recursion=0):
         assert len(r) == 2, f"'r' range requires a beginning and end (length 2), not {r}"
-        self.problems = []
         if window:  return self.rolling_train(r, data, window, r_step, x_step, recursion)
         else:       return self.absolute_train(r, data, r_step, x_step, True, False, recursion, True)
 
     # * Train an r range for each window and test it's prediction ability for the next data point    
-    def rolling_train(self, r: iter, data: list, window=10, r_step=1e-4, x_step=.05, recursion=0):
+    def rolling_train(self, r: iter, data: list, window=5, r_step=1e-4, x_step=.05, recursion=0):
         R_groups = []
         success = 0
         total = 0
@@ -68,26 +67,23 @@ class Predictor():
             w_end = i + window
             w_data = data[i:w_end]
             # Train R values and store it
-            Rs = self.absolute_train(r, w_data, r_step, x_step, ret=True, perfection=False, recursion=recursion)
+            Rs = self.absolute_train(r, w_data, r_step, x_step, ret=True, perfection=False, recursion=recursion, use_tqdm=False)
             if len(Rs) != 1:
                 R_groups.append(Rs)
                 # Predict the next piece of data
                 guess = self.predict(Rs=Rs)
                 if guess == data[w_end + 1]:
                     success += 1
-                else:
-                    self.problems.append(w_data)
-
                 # Write the current success rate
                 total += 1
-                tqdm.write(f'{success / total * 100}') 
+                tqdm.write(f'{round(success / total * 100, 2)}\t# R\'s: {len(Rs)}') 
         
         self.Rs = R_groups
         print('Prediction Rate:', success / len(data) * 100)
         return success / len(data) * 100
 
     # * Train an r range using all the data given
-    def absolute_train(self, r: iter, data: list, r_step=1e-7, x_step=.01, ret=False, perfection=True, recursion=0, use_tqdm=False):
+    def absolute_train(self, r: iter, data: list, r_step=1e-7, x_step=.01, ret=False, perfection=True, recursion=0, use_tqdm=True):
         # Optionally have the tqdm bar
         iteration = tqdm([*float_range(*r, r_step)]) if use_tqdm else float_range(*r, r_step)
         # Iterate through possible r-values
@@ -114,23 +110,21 @@ class Predictor():
         if len(Rs):
             return Rs if ret else self.Rs.update(Rs)
         else:
-            tqdm.write(f'Using best r at {best_r_val * 100} %,\tdata = {data}')
+            # tqdm.write(f'Using best r at {round(best_r_val * 100)} %,\tdata = {data}')
+            self.problems.append(list(data))
             return best
 
 
-    def test_r_value(self, r: float, data: list, x_0=0.5, ret_x=False) -> float:
+    def test_r_value(self, r: float, data: list, x=0.5, ret_x=False) -> float:
         assert isinstance(data[0], (bool, int)), f"Data given must be a list of 1/0s or True/Falses, not {type(data[0])}"
         # Iterate through the logistic map, comparing it to the data
         for index, answer in enumerate(data):
-            x_1 = self.logistic_map(r, x_0)
-            # R == 0, L == 0
-            moved_right = x_0 < x_1
-            if moved_right ^ answer:
+            x = self.logistic_map(r, x)
+            # See if its above or below the threshold
+            if (x >= self.threshold) ^ answer or abs(x - self.threshold) < 0.05:
                 progress = index/len(data) # Return how far it got (as a decimal)
-                return (progress, x_1) if ret_x else progress
-            # Move a step in the iteration
-            x_0 = x_1
-        return (1, x_1) if ret_x else 1
+                return (progress, x) if ret_x else progress
+        return (1, x) if ret_x else 1
 
     def _parabolic_map(self, r: float, x: float) -> float:
         return r * x * (1 - x)
@@ -154,20 +148,29 @@ def get_weather_AUS(location = 'Albury'):
 
 
 if __name__ == "__main__":
-    data = get_weather_AUS()
-    test = data[::7]
-    p = Predictor()
-    r = p.train([0, 4], test, window=6, r_step=1e-2, x_step=1e-4)
-    p.save('model.json')
-    print(r)
-
-    # with open('problems.json', 'w') as f:
-    #     json.dump(p.problems, f)
-
-    # data = [0, 1, 1, 1, 0, 1, 0, 0] # 0
+    # data = get_weather_AUS()
+    # test = data[::7]
     # p = Predictor()
-    # r = p.absolute_train([3.3, 4], data, 1e-3, 1e-4, perfection=False, ret=True, use_tqdm=True) 
+    # r = p.train([0, 4], test, window=6, r_step=1e-2, x_step=1e-3)
+    # p.save('model.json')
     # print(r)
-    # print(p.predict())
 
+    length = 10
+    used = []
+    p = Predictor()
 
+    import itertools
+    for num_ones in tqdm(range(length + 1)):
+        data = [1] * num_ones
+        while len(data) < length:
+            data.append(0)
+
+        for d in itertools.permutations(data):
+            if d not in used:
+                # tqdm.write(str(d))
+                used.append(d)
+                p.absolute_train([3.5, 4], d, 1e-2, 1e-2, perfection=False, use_tqdm=False)
+    
+    print(len(p.problems))
+    with open(f'problems-{length}.json', 'w') as f:
+        json.dump(p.problems, f)
